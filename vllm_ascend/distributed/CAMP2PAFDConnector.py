@@ -94,7 +94,8 @@ class CAMP2PAFDConnector(AFDConnectorBase):
         self.ratio = self.attn_size // self.ffn_size  # attn_size / ffn_size, for asymmetric A/F
         world_rank = self.rank + self.ffn_size if role == "attention" else self.rank
         # p2p_rank: 所有FFN [0, ffn_size), 前min_size个Attention [ffn_size, ffn_size+min_size)
-        self.p2p_rank = self.rank + self.min_size if role == "attention" else self.rank
+        # Bug fix: 使用 ffn_size 而不是 min_size
+        self.p2p_rank = self.rank + self.ffn_size if role == "attention" else self.rank
         self.rank = world_rank
 
         print(f"world_size = {self.ffn_size + self.attn_size}, world_rank = {self.rank}")

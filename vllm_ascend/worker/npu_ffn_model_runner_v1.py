@@ -457,7 +457,9 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
                     afd_metadata=afd_metadata,
                     num_tokens=num_tokens_across_dp[0],
                     num_tokens_across_dp=num_tokens_across_dp):
-            for layer_idx in range(0, self.num_layers):
+            start_layer = getattr(self.model.model, 'start_layer', 0)
+            end_layer = getattr(self.model.model, 'end_layer', self.num_layers)
+            for layer_idx in range(start_layer, end_layer):
                 for ubatch_idx in range(num_ubatches):
                     # recv
                     afd_connector_data = self.connector.create_recv_metadata(
