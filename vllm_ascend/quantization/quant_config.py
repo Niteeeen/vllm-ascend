@@ -70,6 +70,109 @@ class AscendQuantConfig(QuantizationConfig):
                 new_k = k.replace("weight_packed", "weight")
                 extra_quant_dict[new_k] = self.quant_description[k]
         self.quant_description.update(extra_quant_dict)
+        
+        # 标记：量化配置映射是否已执行
+        self._quant_mapping_done = False
+        
+        # 尝试立即执行映射（如果 vllm_config 可用，否则延迟到第一次使用）
+        # 这与 deepseek_v2.py 中的权重数据映射逻辑保持一致
+        self._map_quant_description_for_dense_to_moe()
+
+    def _map_quant_description_for_dense_to_moe(self):
+        """
+        当 first_k_dense_replace=0 时，将第一个 MoE 层的量化配置复制到前面的 Dense 层。
+        
+        这个方法与 deepseek_v2.py 中的权重映射逻辑配套使用：
+        - deepseek_v2.py 负责复制权重数据
+        - 本方法负责复制量化元数据
+        
+        适用场景：
+        - 原始模型: first_k_dense_replace=1 (Layer 0 Dense, Layer 1+ MoE)
+        - 原始模型: first_k_dense_replace=3 (Layer 0-2 Dense, Layer 3+ MoE)
+        - 修改后: first_k_dense_replace=0 (所有层都是 MoE)
+        
+        支持延迟执行：如果 vllm_config 在 __init__ 时未完全初始化，
+        会在第一次使用量化配置时自动重试。
+        """
+        # 如果已经执行过，直接返回
+        if self._quant_mapping_done:
+            return
+        
+        try:
+            vllm_config = get_current_vllm_config()
+            
+            # 检查 vllm_config 是否完全初始化
+            if not vllm_config or not vllm_config.model_config:
+                # 未完全初始化，延迟执行（不标记为已完成，允许后续重试）
+                return
+            
+            config = vllm_config.model_config.hf_config
+            
+            # 只在 first_k_dense_replace=0 时执行映射
+            if not hasattr(config, 'first_k_dense_replace') or config.first_k_dense_replace != 0:
+                self._quant_mapping_done = True  # 标记为已完成（不需要映射）
+                return
+            
+            # 1. 找到第一个包含 MoE 量化配置的层索引
+            import re
+            first_moe_layer = None
+            
+            for key in self.quant_description.keys():
+                # 查找包含 experts 或 shared_experts 的层
+                if "model.layers." in key and (".mlp.experts." in key or ".mlp.shared_experts." in key):
+                    # 提取层索引
+                    match = re.search(r"model\.layers\.(\d+)\.", key)
+                    if match:
+                        layer_idx = int(match.group(1))
+                        if first_moe_layer is None or layer_idx < first_moe_layer:
+                            first_moe_layer = layer_idx
+            
+            # 2. 如果没有找到 MoE 层，或者第一个 MoE 层就是 Layer 0，则无需映射
+            if first_moe_layer is None or first_moe_layer == 0:
+                self._quant_mapping_done = True
+                return
+            
+            # 3. 复制第一个 MoE 层的所有 MoE 相关配置到所有前面的层
+            # 需要复制的配置包括：
+            # - model.layers.{N}.mlp.experts.*
+            # - model.layers.{N}.mlp.shared_experts.*
+            # - model.layers.{N}.mlp.gate.weight
+            # - model.layers.{N}.mlp.gate.e_score_correction_bias
+            new_entries = {}
+            for key, value in self.quant_description.items():
+                # 检查是否是第一个 MoE 层的 MoE 相关配置
+                is_moe_config = (
+                    f"model.layers.{first_moe_layer}.mlp.experts." in key or
+                    f"model.layers.{first_moe_layer}.mlp.shared_experts." in key or
+                    f"model.layers.{first_moe_layer}.mlp.gate." in key
+                )
+                
+                if is_moe_config:
+                    # 复制到所有前面的层
+                    for target_layer in range(first_moe_layer):
+                        new_key = key.replace(
+                            f"model.layers.{first_moe_layer}.",
+                            f"model.layers.{target_layer}."
+                        )
+                        new_entries[new_key] = value
+            
+            # 4. 更新量化配置字典
+            if new_entries:
+                self.quant_description.update(new_entries)
+                print(f"[AscendQuantConfig] Mapped {len(new_entries)} quantization config entries from Layer {first_moe_layer} "
+                      f"to Layers 0-{first_moe_layer-1} for first_k_dense_replace=0 compatibility")
+            else:
+                print(f"[AscendQuantConfig] Warning: No MoE quantization config found to map for first_k_dense_replace=0")
+            
+            # 标记为已完成
+            self._quant_mapping_done = True
+        
+        except Exception as e:
+            # 如果获取配置失败，不标记为已完成，允许后续重试
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.debug(f"Defer quant_description mapping: {e}")
+
 
     def __repr__(self) -> str:
         return "AscendQuantConfig:\n" + super().__repr__()
@@ -164,6 +267,10 @@ class AscendQuantConfig(QuantizationConfig):
         self,
         prefix: str,
         fused_mapping: Mapping[str, List[str]] = MappingProxyType({})):
+        # 在使用前确保映射已执行（支持延迟执行）
+        if not self._quant_mapping_done:
+            self._map_quant_description_for_dense_to_moe()
+        
         # adapted from vllm.model_executor.layers.quantization.utils.quant_utils.is_layer_skipped
         proj_name = prefix.split(".")[-1]
         if proj_name in fused_mapping:
